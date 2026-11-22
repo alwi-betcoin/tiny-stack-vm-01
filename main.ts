@@ -1,125 +1,39 @@
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-
-const enc = new TextEncoder();
-
-// Binary ops 0x10..0x22, indexed by op - 0x10 (0 = not a binary op: NEG, NOT, bad).
-// A div/mod by zero answers undefined, which the caller turns into trap 4.
-const B = [(a, b) => (a + b) | 0, (a, b) => (a - b) | 0, Math.imul,
-  (a, b) => b ? a === -2147483648 && b === -1 ? a : (a / b) | 0 : undefined,
-  (a, b) => b ? b === -1 ? 0 : (a % b) | 0 : undefined,
-  (a, b) => b ? Math.floor((a >>> 0) / (b >>> 0)) | 0 : undefined,
-  (a, b) => b ? ((a >>> 0) % (b >>> 0)) | 0 : undefined,
-  0, (a, b) => a & b, (a, b) => a | b, (a, b) => a ^ b, 0,
-  (a, b) => a << (b & 31), (a, b) => a >> (b & 31), (a, b) => (a >>> (b & 31)) | 0, 0,
-  (a, b) => a === b ? 1 : 0, (a, b) => a < b ? 1 : 0, (a, b) => (a >>> 0) < (b >>> 0) ? 1 : 0];
-
-// Tiny stack VM interpreter for make.fun tiny-stack-vm-01 (ISA v1).
-// Runs every program under $MAKEFUN_INPUT_DIR and writes its stdout + exit code.
-//
-// Opcode table T, one char per byte 0x00..0x53: ' ' (32) = unknown opcode,
-// otherwise charCode - 33 packs (immediate bytes, pops, pushes) as imm*16+pops*4+pushes.
-const T = '!2b%\'+,0        *******&***&*** ***             AEEA!           &)              %%"%';
-
-function run(p, inp) {
-  const n = p.length;
-  const D = new Int32Array(256);
-  let sp = 0;
-  const C = new Int32Array(64);
-  let cp = 0;
-  const M = new Int32Array(256);
-  const out = new Uint8Array(65536);
-  let ol = 0;
-  let ip = 0;
-  let pc = 0;
-  let steps = 0;
-  const end = (code) => ({ out: out.slice(0, ol), code });
-  for (;;) {
-    if (steps === 1000000) return end(10);
-    if (pc < 0 || pc >= n) return end(9);
-    const op = p[pc];
-    const t = T.charCodeAt(op) - 33;
-    if (!(t >= 0)) return end(5);
-    const imm = t >> 4, pops = (t >> 2) & 3, pushes = t & 3;
-    if (pc + imm >= n) return end(9);
-    steps++;
-    const next = pc + 1 + imm;
-    if (sp < pops) return end(2);
-    if (sp - pops + pushes > 256) return end(3);
-    pc = next;
-    switch (op) {
-      case 0x00: return end(0);
-      case 0x01: D[sp++] = (p[next - 1] << 24) >> 24; break;
-      case 0x02: D[sp++] = p[next - 4] | (p[next - 3] << 8) | (p[next - 2] << 16) | (p[next - 1] << 24); break;
-      case 0x03: sp--; break;
-      case 0x04: D[sp] = D[sp - 1]; sp++; break;
-      case 0x05: { const t = D[sp - 1]; D[sp - 1] = D[sp - 2]; D[sp - 2] = t; break; }
-      case 0x06: D[sp] = D[sp - 2]; sp++; break;
-      case 0x07: { const a = D[sp - 3]; D[sp - 3] = D[sp - 2]; D[sp - 2] = D[sp - 1]; D[sp - 1] = a; break; }
-      case 0x17: D[sp - 1] = -D[sp - 1] | 0; break;
-      case 0x1b: D[sp - 1] = ~D[sp - 1]; break;
-      default: {
-        const b = D[sp - 1];
-        const a = D[sp - 2];
-        const r = B[op - 0x10](a, b);
-        if (r === undefined) return end(4);
-        sp -= 2;
-        D[sp++] = r;
-        break;
-      }
-      case 0x30: case 0x31: case 0x32: {
-        const rel = ((p[next - 2] | (p[next - 1] << 8)) << 16) >> 16;
-        let take = true;
-        if (op !== 0x30) { const v = D[--sp]; take = op === 0x31 ? v === 0 : v !== 0; }
-        if (take) pc = next + rel;
-        break;
-      }
-      case 0x33:
-        if (cp === 64) return end(7);
-        C[cp++] = next;
-        pc = p[next - 2] | (p[next - 1] << 8);
-        break;
-      case 0x34:
-        if (cp === 0) return end(8);
-        pc = C[--cp];
-        break;
-      case 0x40: {
-        const addr = D[sp - 1];
-        if (addr < 0 || addr >= 256) return end(6);
-        D[sp - 1] = M[addr];
-        break;
-      }
-      case 0x41: {
-        const addr = D[sp - 1];
-        const v = D[sp - 2];
-        if (addr < 0 || addr >= 256) return end(6);
-        sp -= 2;
-        M[addr] = v;
-        break;
-      }
-      case 0x50: {
-        const bytes = enc.encode(String(D[sp - 1]));
-        if (ol + bytes.length > 65536) return end(11);
-        sp--;
-        out.set(bytes, ol);
-        ol += bytes.length;
-        break;
-      }
-      case 0x51:
-        if (ol + 1 > 65536) return end(11);
-        out[ol++] = D[--sp] & 255;
-        break;
-      case 0x52: D[sp++] = ip < inp.length ? inp[ip++] : -1; break;
-      case 0x53: return end(D[--sp] & 255);
-    }
-  }
-}
-
-const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-for (const id of readdirSync(I).sort()) {
-  const r = run(new Uint8Array(readFileSync(join(I, id, 'program.bin'))), new Uint8Array(readFileSync(join(I, id, 'input.bin'))));
-  mkdirSync(join(O, id), { recursive: true });
-  writeFileSync(join(O, id, 'stdout.bin'), r.out);
-  writeFileSync(join(O, id, 'exit.txt'), r.code + '\n');
-}
+import{readdirSync as D,readFileSync as R,mkdirSync as M,writeFileSync as W}from"node:fs";
+let T="!2b%'+,0        *******&***&*** ***             AEEA!           &)              %%\"%",
+B=[(a,b)=>a+b,(a,b)=>a-b,Math.imul,(a,b)=>a/b,(a,b)=>a%b,(a,b)=>(a>>>0)/(b>>>0),(a,b)=>(a>>>0)%(b>>>0),0,(a,b)=>a&b,(a,b)=>a|b,(a,b)=>a^b,0,(a,b)=>a<<(b&31),(a,b)=>a>>(b&31),(a,b)=>a>>>(b&31),0,(a,b)=>a==b?1:0,(a,b)=>a<b?1:0,(a,b)=>(a>>>0)<(b>>>0)?1:0];
+function V(p,i){
+let n=p.length,S=new Int32Array(256),s=0,C=new Int32Array(64),c=0,m=new Int32Array(256),O=new Uint8Array(65536),l=0,j=0,P=0,k=0,a,b,E=z=>[O.slice(0,l),z];
+for(;;){
+if(k==1e6)return E(10);
+if(P<0|P>=n)return E(9);
+let o=p[P],t=T.charCodeAt(o)-33,u=t>>2&3,x=P+1+(t>>4);
+if(!(t>=0))return E(5);
+if(x>n)return E(9);
+k++;
+if(s<u)return E(2);
+if(s-u+(t&3)>256)return E(3);
+P=x;
+switch(o){
+case 0:return E(0);
+case 1:S[s++]=(p[x-1]<<24)>>24;break;
+case 2:S[s++]=p.readInt32LE(x-4);break;
+case 3:s--;break;
+case 4:S[s]=S[s-1];s++;break;
+case 5:a=S[s-1];S[s-1]=S[s-2];S[s-2]=a;break;
+case 6:S[s]=S[s-2];s++;break;
+case 7:a=S[s-3];S[s-3]=S[s-2];S[s-2]=S[s-1];S[s-1]=a;break;
+case 23:S[s-1]=-S[s-1];break;
+case 27:S[s-1]=~S[s-1];break;
+case 48:case 49:case 50:if(o==48||(S[--s]==0)==(o==49))P=x+p.readInt16LE(x-2);break;
+case 51:if(c==64)return E(7);C[c++]=x;P=p[x-2]|p[x-1]<<8;break;
+case 52:if(!c)return E(8);P=C[--c];break;
+case 64:a=S[s-1];if(a>>8)return E(6);S[s-1]=m[a];break;
+case 65:a=S[s-1];if(a>>8)return E(6);m[a]=S[s-2];s-=2;break;
+case 80:{let v=S[--s],q=""+v;if(l+q.length>65536)return E(11);for(let z of q)O[l++]=z.charCodeAt(0);break}
+case 81:if(l==65536)return E(11);O[l++]=S[--s]&255;break;
+case 82:S[s++]=j<i.length?i[j++]:-1;break;
+case 83:return E(S[--s]&255);
+default:b=S[s-1];a=S[s-2];if(o>18&&o<23&&!b)return E(4);s--;S[s-1]=B[o-16](a,b);
+}}}
+let I=process.env.MAKEFUN_INPUT_DIR||"/input",O=process.env.MAKEFUN_OUTPUT_DIR||"/output";
+for(let d of D(I).sort()){let r=V(R(I+"/"+d+"/program.bin"),R(I+"/"+d+"/input.bin"));M(O+"/"+d,{recursive:!0});W(O+"/"+d+"/stdout.bin",r[0]);W(O+"/"+d+"/exit.txt",r[1]+"\n")}
